@@ -1,3 +1,9 @@
+import torch
+import random
+import numpy as np
+import copy
+import pandas as pd
+
 def column_name_converter(string):
     return string.lower().replace("\n", "_").replace(" ", "_")
 
@@ -84,3 +90,39 @@ def create_input(config=None, src_data=None, src_keys=None, tgt_data=None, src_p
         assert bool(tgt[0]) == (src[-1, close_price_idx] < src_data[i, close_price_idx])
         data.append((src, tgt))
     return data
+
+def batch_generator(bs=8, data=None):
+    assert data is not None
+    random.shuffle(data)
+    idx = bs
+    while idx < len(data) + 1:
+        batch_list = copy.deepcopy(data[idx - bs: idx])
+
+        src, tgt = [], []
+        for i in range(bs):
+            src_tgt_tup = batch_list[i]
+            src.append(src_tgt_tup[0])
+            tgt.append(src_tgt_tup[1])
+        src = np.array(src)
+        tgt = np.array(tgt)
+        src = src.astype(float)
+        tgt = tgt.astype(float)
+        src = torch.tensor(src)
+        tgt = torch.tensor(tgt)
+
+        idx += bs
+        yield (src.cuda(), tgt.cuda())
+
+def get_data(config=None):
+    assert config is not None
+    df = pd.read_excel('res/Euro.xls')
+    df = change_column_names(df)
+    df = handle_neural_index(df)
+    df = pd.concat([df, pd.DataFrame(data=rule_closeup(df), columns=['rule_closeup'])], axis=1)
+    src_data, tgt_data, src_keys, tgt_keys, src_pos_dict = df_to_src_tgt(config=config, df=df)
+    data = create_input(config=config, src_data=src_data, tgt_data=tgt_data, src_pos_dict=src_pos_dict)
+    return data
+
+def split_data(data):
+    n_datapoints = len(data)
+    return data[:int(n_datapoints * 0.9)], data[int(n_datapoints * 0.9):]

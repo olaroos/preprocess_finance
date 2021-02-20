@@ -6,17 +6,8 @@ from src.modules import (
     PositionalEncoding,
     LossSoftmax,
 )
-from src.
-df = pd.read_excel('res/Euro.xls')
-df = change_column_names(df)
-df = handle_neural_index(df)
-df = pd.concat([df, pd.DataFrame(data=rule_closeup(df), columns=['rule_closeup'])], axis=1)
-n_columns = len(df.index)
-training_df = df.iloc[:int(n_columns*0.9)]
-valid_df = df.iloc[int(n_columns*0.9):]
-src_data, tgt_data, src_keys, tgt_keys, src_pos_dict = df_to_src_tgt(config=config, df=training_df)
-data = create_input(config=config, src_data=src_data, tgt_data=tgt_data, src_pos_dict=src_pos_dict)
-
+from src.fun import (get_data,
+                     split_data)
 config = {'bs': 8,
           'n_layers': 6,
           'd_model': 10,
@@ -39,6 +30,7 @@ class TransformerModel(nn.Module):
         nhead = config["nhead"]
         nlayers = config["n_layers"]
         dropout = config["dropout"]
+        seq_len = config["sequence_length"]
 
         self.positional_encoder = PositionalEncoding(d_model=d_model, max_len=128)
 
@@ -50,7 +42,7 @@ class TransformerModel(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, nlayers)
 
-        self.post_encoder = nn.Linear(d_model, 2)
+        self.post_encoder = nn.Linear(d_model * seq_len, 2)
         self.softmax = LossSoftmax()
 
         # Seed
@@ -66,199 +58,49 @@ class TransformerModel(nn.Module):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
 
-    def init_weights(self):
-        init_range = 0.0001
-        self.post_decoder.weight.data.uniform_(-init_range, init_range)
-        self.post_decoder.bias.data.zero_()
-        self.copy_gate.linear1.weight.data.uniform_(-init_range, init_range)
-        self.copy_gate.linear1.bias.data.zero_()
 
-    def sequence_to_first_dimension(self, tensor, batch=None):
-        assert batch is not None
-        assert tensor.shape[0] == batch.bs
+    def sequence_to_first_dimension(self, tensor, bs=None):
+        assert tensor.shape[0] == bs
         return tensor.transpose(0, 1).contiguous()
 
-    def bs_to_first_dimension(self, tensor, batch=None):
-        assert batch is not None
-        assert tensor.shape[1] == batch.bs
+    def bs_to_first_dimension(self, tensor, bs=None):
+        assert tensor.shape[1] == bs
         return tensor.transpose(0, 1).contiguous()
 
-    def _generate_square_subsequent_mask(self, sz, to_cuda=True):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = (
-            mask.float()
-            .masked_fill(mask == 0, float("-inf"))
-            .masked_fill(mask == 1, float(0.0))
+    def forward(self, batch, config=None):
+        assert config is not None
+
+        src, tgt = batch[0], batch[1]
+
+        """pre-encoder block"""
+
+        src = self.sequence_to_first_dimension(src, batch=batch)
+        src = self.encoder_pos_encoder(src)
+
+        """encoder block"""
+        # no self-attention mask needed only padding between sequences in batch
+        memory = self.transformer_encoder(src, mask=None)
+        memory = memory.view(memory.shape[0] * memory.shape[1], -1)
+        output = self.post_encoder(memory)
+
+
+        """calculate loss"""
+        logprob = self.eps_log_softmax(output, dim=2)
+        target = self.sequence_to_first_dimension(
+            tgt, batch=batch
         )
-        assert isinstance(mask, torch.FloatTensor)
-        return mask if not to_cuda else mask.cuda()
+        loss = F.nll_loss(input=logprob.view(-1, logprob.shape[-1]), target=target.view(-1))
 
-    def make_key_masks(self, batch, to_cuda=False):
-        """
-            Returns torch.BoolTensor masks
-            True will mask
-            False will not mask
-        """
-        src_key_mask = torch.ones(batch.src_idx.shape)
-        tgt_key_mask = torch.ones(batch.tgt_input_idx.shape)
-        for b in range(batch.bs):
-            src_key_mask[b, : int(batch.src_len[b])] = torch.zeros(
-                int(batch.src_len[b])
-            )
-            tgt_key_mask[b, : int(batch.tgt_len[b])] = torch.zeros(
-                int(batch.tgt_len[b])
-            )
-        if to_cuda:
-            return src_key_mask.bool().cuda(), tgt_key_mask.bool().cuda()
-        else:
-            return src_key_mask.bool(), tgt_key_mask.bool()
+        """statistics"""
+        loss_stats = self.get_loss_stats(
+            batch=batch,
+            loss=loss,
+            logprob=logprob,
+            target=target,
 
-    def get_pre_encoder_block(self, batch=None, encoder_dict=None):
-        assert batch is not None
-        assert encoder_dict is not None
-        # still don't understand why we multiply by square-root of encoder dictionary size
-        src = self.encoder_idx_embedding(batch.src_idx)
-        src = torch.cat((src, self.tag_embedding(batch)), -1)
-        src = torch.cat((src, batch.src_emb), -1)
-        return src
-
-    def calc_idx_emb(self, tensor):
-        assert int(torch.max(tensor)) < self.decoder_idx_embedding.num_embeddings
-        return self.decoder_idx_embedding(tensor)
-
-    def calc_previous_step_copy(self, tensor):
-        assert int(torch.max(tensor)) < self.decoder_previous_step_copy.num_embeddings
-        return self.decoder_previous_step_copy(tensor)
-
-    def calc_tgt_pos_tag(self, tensor):
-        assert int(torch.max(tensor)) < self.decoder_pos_embedding.num_embeddings
-        return self.decoder_pos_embedding(tensor)
-
-    def calc_pos_copy_emb(self, tensor):
-        assert int(torch.max(tensor)) < self.decoder_pos_copy_embedding.num_embeddings
-        return self.decoder_pos_copy_embedding(tensor)
-
-    def get_pre_decoder_block_from_batch(self, batch=None):
-        assert batch is not None
-        return self.get_pre_decoder_block(
-            idx_emb=batch.tgt_input_idx,
-            prev_word_copied=batch.tgt_previous_word_copied,
-            tgt_pos_tag=batch.tgt_pos_tag,
-            tgt_copy_pos=batch.tgt_copy_pos,
-            tgt_emb=batch.tgt_emb,
         )
+        return loss_stats
 
-    def get_decoder_masks(self, input=None, src_key_mask=None, tgt_key_mask=None):
-        src_tgt_key_mask, tgt_src_key_mask = self.make_3D_key_mask(
-            src_key_mask, tgt_key_mask, n_head=self.conf["number_heads"]
-        )
-        tgt_attn_mask = self._generate_square_subsequent_mask(input.shape[0])
-        return tgt_attn_mask, src_tgt_key_mask
-
-    def get_decoder_0(
-        self,
-        input=None,
-        memory=None,
-        src_key_mask=None,
-        tgt_key_mask=None,
-        to_cuda=True,
-    ):
-        assert input is not None
-        assert memory is not None
-        assert src_key_mask is not None
-        assert tgt_key_mask is not None
-
-        tgt_attn_mask = self._generate_square_subsequent_mask(
-            input.shape[0], to_cuda=to_cuda
-        )
-        return self.transformer_decoder(
-            input,
-            memory,
-            tgt_mask=tgt_attn_mask,
-            memory_mask=None,
-            memory_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-        )
-
-    def adjust_heads_for_key_mask(self, key_mask=None, number_heads=None, bs=None):
-        assert key_mask.shape[0] <= bs * number_heads
-        assert key_mask.shape[0] <= bs * number_heads
-        return key_mask[0 : bs * number_heads]
-        return key_mask[0 : bs * number_heads]
-
-    def get_prob_copy(
-        self,
-        batch=None,
-        input=None,
-        memory=None,
-        src_key_mask=None,
-        tgt_key_mask=None,
-        to_cuda=True,
-    ):
-
-        tgt_attn_mask = self._generate_square_subsequent_mask(
-            input.shape[0], to_cuda=to_cuda
-        )
-        src_key_mask = self.adjust_heads_for_key_mask(key_mask=src_key_mask, number_heads=8, bs=batch.bs)
-        tgt_key_mask = self.adjust_heads_for_key_mask(key_mask=tgt_key_mask, number_heads=8, bs=batch.bs)
-
-        prob_copy = self.transformer_prob_copy_1(
-            input,
-            memory,
-            tgt_mask=tgt_attn_mask,
-            memory_mask=None,
-            memory_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-        )
-        src_key_mask = self.adjust_heads_for_key_mask(key_mask=src_key_mask, number_heads=4, bs=batch.bs)
-        tgt_key_mask = self.adjust_heads_for_key_mask(key_mask=tgt_key_mask, number_heads=4, bs=batch.bs)
-
-        prob_copy = self.transformer_prob_copy_2(
-            prob_copy,
-            memory,
-            tgt_mask=tgt_attn_mask,
-            memory_mask=None,
-            memory_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-        )
-        src_key_mask = self.adjust_heads_for_key_mask(key_mask=src_key_mask, number_heads=2, bs=batch.bs)
-        tgt_key_mask = self.adjust_heads_for_key_mask(key_mask=tgt_key_mask, number_heads=2, bs=batch.bs)
-
-        prob_copy = self.transformer_prob_copy_3(
-            prob_copy,
-            memory,
-            tgt_mask=tgt_attn_mask,
-            memory_mask=None,
-            memory_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-        )
-        src_key_mask = self.adjust_heads_for_key_mask(key_mask=src_key_mask, number_heads=1, bs=batch.bs)
-        tgt_key_mask = self.adjust_heads_for_key_mask(key_mask=tgt_key_mask, number_heads=1, bs=batch.bs)
-
-        _, prob_copy = self.transformer_prob_copy_last(
-            prob_copy,
-            memory,
-            tgt_mask=tgt_attn_mask,
-            memory_mask=None,
-            memory_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-        )
-
-        prob_copy_mask = src_key_mask.unsqueeze(1).repeat(1, tgt_key_mask.shape[-1], 1)
-        prob_copy_mask = torch.where(
-            prob_copy_mask == False,
-            torch.ones(prob_copy_mask.shape).float()
-            if not to_cuda
-            else torch.ones(prob_copy_mask.shape).float().cuda(),
-            torch.zeros(prob_copy_mask.shape).float()
-            if not to_cuda
-            else torch.zeros(prob_copy_mask.shape).float().cuda(),
-        )
-
-        prob_copy = prob_copy * prob_copy_mask
-        prob_copy = self.sequence_to_first_dimension(prob_copy, batch=batch)
-
-        return prob_copy
 
     def get_loss_stats(
         self,
@@ -578,88 +420,6 @@ class TransformerModel(nn.Module):
         )
         return generated_tgt_input
 
-    def forward(
-        self, batch, config=None, encoder_dict=None, decoder_dict=None, loader=None
-    ):
-        assert config is not None
-        assert encoder_dict is not None
-        assert decoder_dict is not None
-        src_key_mask, tgt_key_mask = self.make_key_masks(batch, to_cuda=True)
-
-        """pre-encoder block"""
-        src = self.get_pre_encoder_block(batch=batch, encoder_dict=encoder_dict)
-        src = self.sequence_to_first_dimension(src, batch=batch)
-        src = self.encoder_pos_encoder(src)
-
-        """encoder block"""
-        # no self-attention mask needed only padding between sequences in batch
-        memory = self.transformer_encoder(
-            src, mask=None, src_key_padding_mask=src_key_mask
-        )
-
-        """generate new input if teacher-forcing"""
-        persistent_tgt_input = self.generate_decoder_input(
-            batch,
-            memory=memory,
-            decoder_dict=decoder_dict,
-            loader=loader,
-            src_key_mask=src_key_mask,
-            tgt_key_mask=tgt_key_mask,
-        )
-
-        tgt_input = self.sequence_to_first_dimension(
-            persistent_tgt_input.cuda(), batch=batch
-        )
-        tgt_input = self.decoder_pos_encoder(tgt_input)
-
-        """decoder block"""
-        output_0 = self.get_decoder_0(
-            input=tgt_input,
-            memory=memory,
-            src_key_mask=src_key_mask,
-            tgt_key_mask=tgt_key_mask,
-        )
-
-        prob_generate = self.post_decoder(output_0)
-
-        prob_copy = self.get_prob_copy(
-            batch=batch,
-            input=output_0,
-            memory=memory,
-            src_key_mask=src_key_mask,
-            tgt_key_mask=tgt_key_mask,
-        )
-        copy_gate = self.copy_gate(output_0)
-
-        """after decoder block"""
-        assert prob_generate.shape[0:1] == copy_gate.shape[0:1]
-        assert prob_copy.shape[0:1] == copy_gate.shape[0:1]
-        prob_generate = prob_generate * (1 - copy_gate)
-        prob_copy = prob_copy * copy_gate
-        output = torch.cat((prob_generate, prob_copy), -1)
-
-        """calculate loss"""
-        logprob = self.eps_log_softmax(output, dim=2)
-        target = self.sequence_to_first_dimension(
-            batch.tgt_copy_output_idx, batch=batch
-        )
-        assert logprob.shape[0:1] == target.shape[0:1]
-        loss = F.nll_loss(
-            input=logprob.view(-1, logprob.shape[-1]),
-            target=target.view(-1),
-            ignore_index=decoder_dict.pad_token_idx,
-        )
-
-        """statistics"""
-        loss_stats = self.get_loss_stats(
-            batch=batch,
-            loss=loss,
-            logprob=logprob,
-            target=target,
-            copy_gate=copy_gate,
-            decoder_dict=decoder_dict,
-        )
-        return loss_stats
 
     def validation_loss(
         self, config=None, loader=None, encoder_dict=None, decoder_dict=None
@@ -808,3 +568,5 @@ class TransformerModel(nn.Module):
         entropy = F.softmax(entropy, dim=dim)
         logprob = torch.log(entropy + eps)
         return logprob
+
+loader = batch_generator(data=training_data)
