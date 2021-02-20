@@ -12,9 +12,6 @@ def change_column_names(df):
     column_name1 = [column_name_converter(column) for column in column_name0]
     column_name2 = list(df.iloc[0])
     assert len(column_name1) == len(column_name2)
-    print(column_name1)
-    print(column_name2)
-    print(column_name0)
     prefix = ''
     for i, name in enumerate(column_name2):
         if isinstance(name, str):
@@ -107,8 +104,8 @@ def batch_generator(bs=8, data=None):
         tgt = np.array(tgt)
         src = src.astype(float)
         tgt = tgt.astype(float)
-        src = torch.tensor(src)
-        tgt = torch.tensor(tgt)
+        src = torch.LongTensor(src)
+        tgt = torch.LongTensor(tgt)
 
         idx += bs
         yield (src.cuda(), tgt.cuda())
