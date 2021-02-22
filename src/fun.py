@@ -37,6 +37,10 @@ def change_column_names(df):
 
 
 def handle_neural_index(df):
+    """
+        the neural_index column has string values, turn them into int
+        :returns: changed dataframe
+    """
     key = 'neural_index'
     if key in list(df.keys()):
         for i in df.index:
@@ -51,7 +55,7 @@ def rule_closeup(df):
     """
     assert 'close_price' in list(df.columns)
     assert 'date' in list(df.columns)
-
+    # can't calculate if first row closed up because it's the first row... (add None)
     closeup = [None]
     for i in range(1, len(df.index)):
         previous_close_price = df.iloc[i - 1]['close_price']
@@ -62,8 +66,10 @@ def rule_closeup(df):
 
 
 def df_to_src_tgt(config=None, df=None):
+    """
+    :return: input (src) and output (tgt) as numpy arrays
+    """
     src_keys = list(df.keys())
-
     tgt_keys = [config['tgt_key']]
     for key in tgt_keys + config['forbidden_keys']:
         if key in src_keys:
@@ -74,7 +80,10 @@ def df_to_src_tgt(config=None, df=None):
     return src_data, tgt_data, src_keys, tgt_keys, src_pos_dict
 
 
-def create_input(config=None, src_data=None, src_keys=None, tgt_data=None, src_pos_dict=None):
+def create_input(config=None, src_data=None, tgt_data=None, src_pos_dict=None):
+    """
+    :return:
+    """
     assert src_data.shape[0] == tgt_data.shape[0]
 
     n_datapoints = src_data.shape[0]
@@ -88,15 +97,14 @@ def create_input(config=None, src_data=None, src_keys=None, tgt_data=None, src_p
         data.append((src, tgt))
     return data
 
-def get_data(config=None):
-    assert config is not None
-    df = pd.read_excel('res/Euro.xls')
+
+def get_data_as_df(excel_fname='Euro.xls'):
+    df = pd.read_excel('res/' + excel_fname)
     df = change_column_names(df)
     df = handle_neural_index(df)
     df = pd.concat([df, pd.DataFrame(data=rule_closeup(df), columns=['rule_closeup'])], axis=1)
-    src_data, tgt_data, src_keys, tgt_keys, src_pos_dict = df_to_src_tgt(config=config, df=df)
-    data = create_input(config=config, src_data=src_data, tgt_data=tgt_data, src_pos_dict=src_pos_dict)
-    return data
+    return df
+
 
 def split_data(data):
     n_datapoints = len(data)

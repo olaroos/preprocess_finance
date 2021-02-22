@@ -94,7 +94,7 @@ class TransformerModel(nn.Module):
 
 data = get_data(config)
 training_data, valid_data = split_data(data)
-loader = batch_generator(data=training_data)
+loader = batch_generator(data=training_data, cuda=True)
 src, tgt = next(loader)
 # print(src.shape)
 # print(tgt.shape)
